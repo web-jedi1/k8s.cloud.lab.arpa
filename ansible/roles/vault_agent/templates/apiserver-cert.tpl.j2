@@ -1,0 +1,3 @@
+{{ '{{' }} with secret "pki_k8s_issuing/issue/apiserver" "common_name=kube-apiserver" "alt_names=kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster.local,{{ inventory_hostname }}" "ip_sans={{ k8s_service_ip }},127.0.0.1,{{ ansible_default_ipv4.address }}" {{ '}}' }}
+{{ '{{ .Data.certificate }}' }}
+{{ '{{ end }}' }}

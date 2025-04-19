@@ -1,0 +1,11 @@
+---
+- name: Deploy K8S Control Plane
+  gather_facts: true
+  hosts: k8s_masters
+  become: true
+  vars:
+    k8s_bootstrap_master: "k8s-master-01"
+  roles:
+    - k8s_master
+    - calico
+    

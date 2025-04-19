@@ -1,0 +1,7 @@
+---
+- name: Deploy ECK Operator
+  gather_facts: true
+  hosts: k8s_masters
+  become: true
+  roles:
+    - eck

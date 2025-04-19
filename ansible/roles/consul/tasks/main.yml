@@ -1,0 +1,134 @@
+---
+- name: Install prerequisites
+  ansible.builtin.apt:
+    name: 
+      - apt-transport-https
+      - ca-certificates
+      - gnupg
+      - curl
+      - jq
+    state: present
+    update_cache: yes
+
+- name: Add an apt signing key for Hashi Corp
+  apt_key:
+    url: https://apt.releases.hashicorp.com/gpg
+    state: present
+
+- name: Get architecture fact
+  ansible.builtin.command: dpkg --print-architecture
+  register: arch_output
+  changed_when: false
+
+- name: Add apt repository for Consul
+  apt_repository:
+    repo: "deb [arch={{ arch_output.stdout }}] https://apt.releases.hashicorp.com {{ ansible_distribution_release | lower }} main"
+    state: present
+
+
+- name: Install consul and its dependecies
+  apt: 
+    name:
+      - consul
+    state: present
+    update_cache: yes
+
+# fix for cert auth and kv2 store
+- name: Get Consul gossip key from Vault
+  community.hashi_vault.hashi_vault_read:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    secret: "k8s/consul/gossip"
+  register: gossip_key
+
+- set_fact:
+    consul_gossip_key: "{{ gossip_key.data.data.key }}"
+
+- name: Request TLS certificate from Vault for UI + internal DNS
+  community.hashi_vault.hashi_vault_write:
+    url: "{{ vault_addr }}"
+    token: "{{ vault_token }}"
+    path: "pki_int/issue/consul-ui"
+    data:
+      common_name: "consul.{{ dns_domain_name }}"
+      alt_names: >
+        consul.{{ dns_domain_name }},
+        consul.service.consul,
+        {{ inventory_hostname }},
+        {{ ansible_fqdn }},
+        localhost
+      ip_sans: "{{ ansible_default_ipv4.address }},127.0.0.1"
+      ttl: "720h"
+  register: consul_cert
+
+- name: Create SSL directory
+  file:
+    path: /etc/consul.d/ssl
+    state: directory
+    owner: consul
+    group: consul
+    mode: '0755'
+
+- name: Write Consul TLS cert
+  copy:
+    dest: "/etc/consul.d/ssl/{{ inventory_hostname }}.pem"
+    content: "{{ consul_cert.json.data.certificate }}"
+    mode: '0644'
+
+- name: Write Consul TLS key
+  copy:
+    dest: "/etc/consul.d/ssl/{{ inventory_hostname }}-key.pem"
+    content: "{{ consul_cert.json.data.private_key }}"
+    mode: '0600'
+
+- name: Write Consul CA cert
+  copy:
+    dest: "/etc/consul.d/ssl/ca.pem"
+    content: "{{ consul_cert.json.data.issuing_ca }}"
+    mode: '0644'
+
+- name: Create systemd override directory for consul
+  file:
+    path: /etc/systemd/system/consul.service.d
+    state: directory
+    mode: '0755'
+
+- name: Add override to allow binding to port 443
+  copy:
+    dest: /etc/systemd/system/consul.service.d/override.conf
+    content: |
+      [Service]
+      AmbientCapabilities=CAP_NET_BIND_SERVICE
+      ExecStart=
+      ExecStart=/usr/bin/consul agent -config-dir=/etc/consul.d
+    mode: '0644'
+
+- name: Reload systemd daemon
+  command: systemctl daemon-reexec
+
+- name: Deploy consul config
+  ansible.builtin.template:
+    src: consul.hcl.j2
+    dest: /etc/consul.d/consul.hcl
+    owner: consul
+    group: consul
+    mode: '0640'
+
+- name: Restart Consul
+  systemd:
+    name: consul
+    state: restarted
+    enabled: yes
+
+- name: Wait for Consul HTTPS API
+  ansible.builtin.uri:
+    url: https://{{ inventory_hostname }}:443/v1/status/leader
+    method: GET
+    validate_certs: no
+    status_code: 200
+  register: consul_health
+  retries: 5
+  delay: 5
+  until: consul_health.status == 200
+
+

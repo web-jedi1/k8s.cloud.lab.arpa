@@ -1,0 +1,168 @@
+---
+- name: Install prerequisites
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - gnupg
+      - curl
+    state: present
+    update_cache: yes
+
+
+- name: Add HashiCorp APT signing key
+  ansible.builtin.apt_key:
+    url: https://apt.releases.hashicorp.com/gpg
+    state: present
+
+
+- name: Get architecture
+  ansible.builtin.command: dpkg --print-architecture
+  register: arch_output
+  changed_when: false
+
+
+- name: Add HashiCorp apt repo
+  ansible.builtin.apt_repository:
+    repo: "deb [arch={{ arch_output.stdout }}] https://apt.releases.hashicorp.com {{ ansible_distribution_release | lower }} main"
+    state: present
+
+
+- name: Install Vault
+  ansible.builtin.apt:
+    name: vault
+    state: present
+    update_cache: yes
+
+
+- name: Create Vault Agent template directory
+  ansible.builtin.file:
+    path: /etc/vault.d/templates
+    state: directory
+    mode: '0755'
+
+
+- name: Create vault-agent user
+  ansible.builtin.user:
+    name: vault-agent
+    system: yes
+    shell: /usr/sbin/nologin
+
+
+- name: Lookup Vault Identity Entity (if exists)
+  become: false
+  community.hashi_vault.vault_read:
+    url: "{{ vault_addr }}"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+    path: "identity/entity/name/vault-agent-{{ inventory_hostname }}"
+  register: existing_entity
+  failed_when: false
+  delegate_to: localhost
+
+
+- name: Create Vault Identity Entity for Vault Agent
+  become: false
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+    path: "identity/entity"
+    data:
+      name: "vault-agent-{{ inventory_hostname }}"
+      metadata:
+        hostname: "{{ inventory_hostname }}"
+        ip_address: "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
+  register: vault_entity
+  delegate_to: localhost
+  when: existing_entity.json is not defined
+
+
+- name: Read Vault Identity Entity after creation
+  become: false
+  community.hashi_vault.vault_read:
+    url: "{{ vault_addr }}"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+    path: "identity/entity/name/vault-agent-{{ inventory_hostname }}"
+  register: final_entity
+  delegate_to: localhost
+  when: existing_entity.json is not defined
+
+
+- name: Set final_entity to correct value based on lookup or re-read
+  set_fact:
+    final_entity: >-
+      {{
+        final_entity if (final_entity is defined and final_entity.json is defined)
+        else existing_entity
+      }}
+  delegate_to: localhost
+
+
+- name: Ensure Vault identity entity was found or created
+  ansible.builtin.fail:
+    msg: "No Vault identity entity found or created."
+  when: final_entity.data.data.id is not defined
+  delegate_to: localhost
+
+
+- name: Bootstrap Vault Agent token
+  become: false
+  community.hashi_vault.vault_write:
+    url: "{{ vault_addr }}"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+    path: "auth/token/create/k8s-vault-agent-token"
+    data: {}
+  register: bootstrap_token
+  delegate_to: localhost
+
+
+- name: Write Vault Agent bootstrap token
+  ansible.builtin.copy:
+    dest: "/etc/vault.d/bootstrap-token"
+    content: "{{ bootstrap_token.data.auth.client_token | default(bootstrap_token.data.auth.client_token) }}"
+    mode: '0600'
+    owner: vault-agent
+    group: vault-agent
+
+
+- name: Copy Vault Agent templates to remote hosts
+  ansible.builtin.template:
+    src: "{{ item.name }}.tpl" 
+    dest: "{{ item.destination }}"
+    mode: "{{ item.perms }}"
+  loop: "{{ vault_agent_templates }}"
+
+
+- name: Render systemd unit for Vault Agent
+  ansible.builtin.template:
+    src: vault-agent.service.j2
+    dest: /etc/systemd/system/vault-agent.service
+    mode: '0644'
+  notify:
+    - reload systemd vault
+
+
+- name: Render Vault Agent configuration
+  ansible.builtin.template:
+    src: vault-agent.hcl.j2
+    dest: /etc/vault.d/vault-agent.hcl
+    mode: '0644'
+    owner: vault-agent
+    group: vault-agent
+  notify:
+    - restart vault agent

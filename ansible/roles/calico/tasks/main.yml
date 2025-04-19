@@ -1,0 +1,58 @@
+---
+- name: Check if Calico operator is already installed
+  ansible.builtin.command: kubectl get ns calico-system
+  register: calico_ns
+  failed_when: false
+  changed_when: false
+  when: inventory_hostname == "{{ k8s_bootstrap_master }}"
+
+
+- name: Install Calico operator manifest
+  ansible.builtin.shell: |
+    kubectl create --kubeconfig /etc/kubernetes/admin.conf -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.3/manifests/tigera-operator.yaml
+  register: calico_create
+  failed_when: calico_create.rc != 0 and 'AlreadyExists' not in calico_create.stderr
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+    - calico_ns.rc != 0
+
+
+- name: Create k8s dir for CRDs
+  ansible.builtin.file:
+    state: directory
+    path: /usr/share/kubernetes/crd
+    mode: '0740'
+
+
+- name: Copy custom-resources.yaml to control plane
+  ansible.builtin.copy:
+    remote_src: false
+    src: calico-crd.yml
+    dest: /usr/share/kubernetes/crd/calico-crd.yml
+  when: inventory_hostname == "{{ k8s_bootstrap_master }}"
+
+
+- name: Apply Calico custom resources
+  ansible.builtin.shell: |
+    kubectl apply --kubeconfig /etc/kubernetes/admin.conf -f /usr/share/kubernetes/crd/calico-crd.yml
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+    - calico_ns.rc != 0
+
+
+- name: Wait for calico-node pods to appear
+  ansible.builtin.shell: |
+    kubectl --kubeconfig /etc/kubernetes/admin.conf get pods -n calico-system -l k8s-app=calico-node --no-headers
+  register: calico_pods
+  retries: 12
+  delay: 10
+  until: calico_pods.stdout_lines | length > 0
+  when: inventory_hostname == "{{ k8s_bootstrap_master }}"
+
+
+- name: Wait for Calico pods to become ready
+  ansible.builtin.shell: |
+    kubectl --kubeconfig /etc/kubernetes/admin.conf -n calico-system wait --for=condition=ready pod -l k8s-app=calico-node --timeout=180s
+  register: calico_wait
+  failed_when: calico_wait.rc != 0 and 'no matching resources found' not in calico_wait.stderr
+  when: inventory_hostname == "{{ k8s_bootstrap_master }}"

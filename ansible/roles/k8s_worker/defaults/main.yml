@@ -1,0 +1,4 @@
+---
+vault_addr: "https://vault.arpa.local:8200"
+ansible_pki_path: "/usr/share/automation/secrets/hvac"
+k8s_tld: "arpa.local"

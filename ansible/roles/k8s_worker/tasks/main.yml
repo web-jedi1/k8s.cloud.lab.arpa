@@ -1,0 +1,181 @@
+- name: Install prerequisites
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - gnupg
+      - curl
+    state: present
+    update_cache: yes
+
+
+- name: Add containerd GPG key
+  ansible.builtin.apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+
+- name: Add containerd apt repository
+  ansible.builtin.apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release | lower }} stable"
+    state: present
+    filename: containerd
+
+
+- name: Install containerd
+  ansible.builtin.apt:
+    name: containerd.io
+    state: present
+    update_cache: yes
+
+
+- name: Create containerd config directory
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+
+
+- name: Generate default containerd config
+  ansible.builtin.command:
+    cmd: containerd config default
+  register: containerd_config
+  changed_when: false
+
+
+- name: Write containerd config to file
+  ansible.builtin.copy:
+    content: "{{ containerd_config.stdout }}"
+    dest: /etc/containerd/config.toml
+
+
+- name: Set SystemdCgroup to true in containerd config
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+
+
+- name: Restart containerd
+  ansible.builtin.systemd:
+    name: containerd
+    state: restarted
+    enabled: true
+
+
+- name: Remove swap from fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\s+swap\s+.*)$'
+    replace: '# \1'
+
+
+- name: Disable swap
+  ansible.builtin.command: swapoff -a
+  when: ansible_swaptotal_mb > 0
+
+
+- name: Ensure keyrings directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+
+- name: Download Kubernetes GPG key (ASCII-armored)
+  ansible.builtin.get_url:
+    url: https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    mode: '0644'
+
+
+- name: Convert Kubernetes key to GPG binary format (dearmor)
+  ansible.builtin.command:
+    cmd: >
+      gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      /etc/apt/keyrings/kubernetes-apt-keyring.asc
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+
+- name: Add Kubernetes APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /"
+    state: present
+    filename: kubernetes
+
+- name: Install Kubernetes binaries
+  ansible.builtin.apt:
+    name:
+      - kubelet
+    state: present
+    update_cache: yes
+  register: kube_binaries
+
+
+- name: Mark Kubernetes packages on hold
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+
+
+- name: Configure node ip
+  ansible.builtin.lineinfile:
+    path: /etc/default/kubelet
+    line: "KUBELET_EXTRA_ARGS=--node-ip={{ ansible_default_ipv4.address }}"
+    create: yes
+
+
+- name: Restart kubelet
+  ansible.builtin.service:
+    name: kubelet
+    daemon_reload: yes
+    state: restarted
+  when: kube_binaries.changed
+
+
+- name: Check if node is already joined (by kubelet config)
+  ansible.builtin.stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: kubelet_conf
+
+
+- name: Read kubeadm token from Vault
+  become: false
+  community.hashi_vault.vault_kv2_get:
+    url: "{{ vault_addr }}"
+    path: "infra/k8s/bootstrap/kubeadm_token"
+    engine_mount_point: "kv"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+  register: join_token
+  delegate_to: localhost
+  when: not kubelet_conf.stat.exists
+
+
+- name: Read ca hash from Vault
+  become: false
+  community.hashi_vault.vault_kv2_get:
+    url: "{{ vault_addr }}"
+    path: "infra/k8s/bootstrap/ca_cert_hash"
+    engine_mount_point: "kv"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+  register: join_ca_hash
+  delegate_to: localhost
+  when: not kubelet_conf.stat.exists
+
+
+- name: Join node
+  ansible.builtin.shell: >
+    kubeadm join api.k8s.{{ k8s_tld }}:6443 \
+    --token {{ join_token }} \
+    --discovery-token-ca-cert-hash sha256:{{ join_ca_hash }}
+  when: not kubelet_conf.stat.exists

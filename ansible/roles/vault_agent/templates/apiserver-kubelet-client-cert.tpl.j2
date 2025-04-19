@@ -1,0 +1,3 @@
+{{ '{{' }} with secret "pki_k8s_issuing/issue/apiserver-kubelet-client" "common_name=kube-apiserver-kubelet-client-{{ inventory_hostname }}" "alt_names={{ inventory_hostname }}" {{ '}}' }}
+{{ '{{ .Data.certificate }}' }}
+{{ '{{ end }}' }

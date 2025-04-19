@@ -1,0 +1,31 @@
+---
+- name: Gather facts on all nodes
+  hosts: all
+  gather_facts: true
+
+
+- name: Deploy K8S Control Plane
+  hosts: k8s_workers
+  become: true
+  roles:
+    - k8s_worker
+
+
+- name: Label workers
+  hosts: k8s-master-01
+  become: true
+  tasks:
+    - name: Label all unlabeled worker nodes as 'worker'
+      ansible.builtin.shell: |
+        for node in $(kubectl get nodes -o json | jq -r '
+          .items[]
+          | select(
+              (.metadata.name | test("^k8s-worker")) and
+              (.metadata.labels["node-role.kubernetes.io/worker"] == null) and
+              (.metadata.labels["node-role.kubernetes.io/control-plane"] == null)
+            )
+          | .metadata.name'); do
+
+          echo "Labeling node $node as worker"
+          kubectl label node "$node" node-role.kubernetes.io/worker=worker --overwrite
+        done

@@ -1,0 +1,25 @@
+exit_after_auth = false
+pid_file = "/var/run/vault-agent.pid"
+
+auto_auth {
+  method "token_file" {
+    config = {
+      token_file_path = "/etc/vault.d/bootstrap-token"
+    }
+  }
+
+  sink "file" {
+    config = {
+      path = "/etc/vault.d/vault-token"
+    }
+  }
+}
+
+{% for tpl in vault_agent_templates | default([]) %}
+template {
+  source      = "/etc/vault.d/templates/{{ tpl.name }}.tpl"
+  destination = "{{ tpl.destination }}"
+  perms       = "{{ tpl.perms }}"
+  command     = "{{ tpl.command | default("chown vault-agent:vault-agent " ~ tpl.destination) }}"
+}
+{% endfor %}

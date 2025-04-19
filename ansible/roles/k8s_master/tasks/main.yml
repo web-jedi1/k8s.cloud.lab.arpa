@@ -1,0 +1,414 @@
+- name: Install prerequisites
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - gnupg
+      - curl
+    state: present
+    update_cache: yes
+
+
+- name: Add containerd GPG key
+  ansible.builtin.apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+
+- name: Add containerd apt repository
+  ansible.builtin.apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release | lower }} stable"
+    state: present
+    filename: containerd
+
+
+- name: Install containerd
+  ansible.builtin.apt:
+    name: containerd.io
+    state: present
+    update_cache: yes
+
+
+- name: Create containerd config directory
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+
+
+- name: Generate default containerd config
+  ansible.builtin.command:
+    cmd: containerd config default
+  register: containerd_config
+  changed_when: false
+
+
+- name: Write containerd config to file
+  ansible.builtin.copy:
+    content: "{{ containerd_config.stdout }}"
+    dest: /etc/containerd/config.toml
+
+
+- name: Set SystemdCgroup to true in containerd config
+  ansible.builtin.replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+
+
+- name: Restart containerd
+  ansible.builtin.systemd:
+    name: containerd
+    state: restarted
+    enabled: true
+
+
+- name: Remove swap from fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\s+swap\s+.*)$'
+    replace: '# \1'
+
+
+- name: Disable swap
+  ansible.builtin.command: swapoff -a
+  when: ansible_swaptotal_mb > 0
+
+
+- name: Ensure keyrings directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+
+- name: Download Kubernetes GPG key (ASCII-armored)
+  ansible.builtin.get_url:
+    url: https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    mode: '0644'
+
+
+- name: Convert Kubernetes key to GPG binary format (dearmor)
+  ansible.builtin.command:
+    cmd: >
+      gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      /etc/apt/keyrings/kubernetes-apt-keyring.asc
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+
+- name: Add Kubernetes APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /"
+    state: present
+    filename: kubernetes
+
+- name: Install Kubernetes binaries
+  ansible.builtin.apt:
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: present
+    update_cache: yes
+  register: kube_binaries
+
+
+- name: Mark Kubernetes packages on hold
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+
+- name: Configure node ip
+  ansible.builtin.lineinfile:
+    path: /etc/default/kubelet
+    line: "KUBELET_EXTRA_ARGS=--node-ip={{ ansible_default_ipv4.address }}"
+    create: yes
+
+
+- name: Restart kubelet
+  ansible.builtin.service:
+    name: kubelet
+    daemon_reload: yes
+    state: restarted
+  when: kube_binaries.changed
+
+
+- name: Check if control plane is already bootstrapped
+  ansible.builtin.stat:
+    path: /etc/kubernetes/manifests/kube-apiserver.yaml
+  register: kube_apiserver_manifest
+
+
+- name: Initialize Kubernetes cluster (master node)
+  ansible.builtin.command: |
+    kubeadm init --apiserver-advertise-address="{{ ansible_default_ipv4.address }}" \
+                 --apiserver-cert-extra-sans="api.k8s.{{ k8s_tld }}"  \
+                 --pod-network-cidr={{ pod_network_cidr }} \
+                 --control-plane-endpoint="api.k8s.{{ k8s_tld }}:6443"
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+    - not kube_apiserver_manifest.stat.exists
+
+
+- name: Upload certs and capture certificate-key
+  ansible.builtin.shell: >
+    kubeadm init phase upload-certs --upload-certs |
+    grep -oE '[a-f0-9]{64}' |
+    tr -d ' '
+  register: ca_certs_key
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+
+- name: Ensure .kube directory exists for svc-ansible
+  ansible.builtin.file:
+    path: /home/svc-ansible/.kube
+    state: directory
+    owner: svc-ansible
+    group: svc-ansible
+    mode: '0700'
+
+- name: Check kubeconfig file exists for svc-ansible
+  ansible.builtin.stat:
+    path: /home/svc-ansible/.kube/config
+  register: kubeconfig_stat
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+
+- name: Copy admin kubeconfig
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/svc-ansible/.kube/config
+    remote_src: yes
+    owner: svc-ansible
+    group: svc-ansible
+    mode: '0644'
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+    - not kubeconfig_stat.stat.exists
+
+- name: Fail if no certificate key found
+  ansible.builtin.fail:
+    msg: "Failed to extract the Kubernetes CA key."
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+    - ca_certs_key.stdout is not defined or ca_certs_key.stdout == ''
+
+
+- name: Store Kubernetes CA cert key in Vault
+  become: false
+  community.hashi_vault.vault_kv2_write:
+    url: "{{ vault_addr }}"
+    path: "infra/k8s/bootstrap/ca_cert_key"
+    engine_mount_point: "kv"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+    data:
+      token: "{{ ca_certs_key.stdout }}"
+      created_at: "{{ ansible_date_time.iso8601 }}"
+  delegate_to: localhost
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+
+
+- name: Generate Kubernetes CA cert hash
+  ansible.builtin.shell: >
+    openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt |
+    openssl rsa -pubin -outform der 2>/dev/null |
+    sha256sum |
+    grep -oE '[a-f0-9]{64}'
+  register: ca_cert_hash_output
+  when: inventory_hostname == "{{ k8s_bootstrap_master }}"
+
+
+- name: Fail if no Kubernetes CA cert hash found
+  ansible.builtin.fail:
+    msg: "Failed to extract the Kubernetes CA hash key."
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+    - ca_cert_hash_output.stdout is not defined or ca_cert_hash_output.stdout == ''
+
+
+- name: Store Kubernetes CA cert hash in Vault
+  become: false
+  community.hashi_vault.vault_kv2_write:
+    url: "{{ vault_addr }}"
+    path: "infra/k8s/bootstrap/ca_cert_hash"
+    engine_mount_point: "kv"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+    data:
+      token: "{{ ca_cert_hash_output.stdout }}"
+      created_at: "{{ ansible_date_time.iso8601 }}"
+  delegate_to: localhost
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+
+
+- name: Generate persistent kubeadm token
+  become: true
+  ansible.builtin.shell: >
+    kubeadm token create --ttl 0
+  register: kubeadm_token_output
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+    - not kube_apiserver_manifest.stat.exists
+
+
+- name: Fail if no kubeadm token found (initial boostrap only)
+  ansible.builtin.fail:
+    msg: "Failed to extract the Kubernetes kubeadm token."
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+    - kubeadm_token_output.stdout is not defined or kubeadm_token_output.stdout == ''
+    - not kube_apiserver_manifest.stat.exists
+
+- name: Store kubeadm token in Vault
+  become: false
+  community.hashi_vault.vault_kv2_write:
+    url: "{{ vault_addr }}"
+    path: "infra/k8s/bootstrap/kubeadm_token"
+    engine_mount_point: "kv"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+    data:
+      token: "{{ kubeadm_token_output.stdout }}"
+      created_at: "{{ ansible_date_time.iso8601 }}"
+  delegate_to: localhost
+  when:
+    - inventory_hostname == "{{ k8s_bootstrap_master }}"
+    - not kube_apiserver_manifest.stat.exists
+
+
+- name: Read kubeadm token from Vault
+  become: false
+  community.hashi_vault.vault_kv2_get:
+    url: "{{ vault_addr }}"
+    path: "infra/k8s/bootstrap/kubeadm_token"
+    engine_mount_point: "kv"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+  register: k8s_bootstrap_token
+  delegate_to: localhost
+  when:
+    - inventory_hostname != "{{ k8s_bootstrap_master }}"
+    - not kube_apiserver_manifest.stat.exists
+
+
+- name: Fail if kubeadm token retrieved from vault
+  ansible.builtin.fail:
+    msg: "Failed to extract the Kubernetes kubeadm token."
+  when:
+    - inventory_hostname != "{{ k8s_bootstrap_master }}"
+    - k8s_bootstrap_token.data.data.token is not defined or k8s_bootstrap_token.data.data.token == ''
+
+
+- name: Read ca cert hash from Vault
+  become: false
+  community.hashi_vault.vault_kv2_get:
+    url: "{{ vault_addr }}"
+    path: "infra/k8s/bootstrap/ca_cert_hash"
+    engine_mount_point: "kv"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+  register: ca_cert_hash
+  delegate_to: localhost
+  when:
+    - inventory_hostname != "{{ k8s_bootstrap_master }}"
+    - not kube_apiserver_manifest.stat.exists
+
+
+- name: Fail if no ca cert hash retrieved from vault
+  ansible.builtin.fail:
+    msg: "Failed to extract the Kubernetes kubeadm token."
+  when:
+    - inventory_hostname != "{{ k8s_bootstrap_master }}"
+    - ca_cert_hash.data.data.token is not defined or ca_cert_hash.data.data.token == ''
+
+
+- name: Read ca cert key from Vault
+  become: false
+  community.hashi_vault.vault_kv2_get:
+    url: "{{ vault_addr }}"
+    path: "infra/k8s/bootstrap/ca_cert_key"
+    engine_mount_point: "kv"
+    auth_method: cert
+    cert_auth_public_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault-cert.pem"
+    cert_auth_private_key: "{{ ansible_pki_path | default(playbook_dir) }}/vault.pem"
+    cacert: "{{ ansible_pki_path | default(playbook_dir) }}/vault-ca.pem"
+    validate_certs: true
+  register: ca_cert_key
+  delegate_to: localhost
+  when:
+    - inventory_hostname != "{{ k8s_bootstrap_master }}"
+    - not kube_apiserver_manifest.stat.exists
+
+
+- name: Fail if no ca cert key retrieved from vault
+  ansible.builtin.fail:
+    msg: "Failed to extract the Kubernetes kubeadm token."
+  when:
+    - inventory_hostname != "{{ k8s_bootstrap_master }}"
+    - ca_cert_key.data.data.token is not defined or ca_cert_key.data.data.token == ''
+
+
+- name: Join as control plane node if not already joined
+  ansible.builtin.command: >
+    kubeadm join api.k8s.{{ k8s_tld }}:6443 \
+    --token {{ k8s_bootstrap_token.data.data.token }} \
+    --discovery-token-ca-cert-hash sha256:{{ ca_cert_hash.data.data.token }} \
+    --control-plane \
+    --certificate-key  {{ ca_cert_key.data.data.token }} \
+    --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+  when:
+    - inventory_hostname != "{{ k8s_bootstrap_master }}"
+    - not kube_apiserver_manifest.stat.exists
+
+
+- name: Check if kubelet config exists
+  ansible.builtin.stat:
+    path: /var/lib/kubelet/config.yaml
+  register: kubelet_config
+
+
+- name: Enable kubelet certificate rotation
+  ansible.builtin.lineinfile:
+    path: /var/lib/kubelet/config.yaml
+    regexp: '^rotateCertificates:'
+    line: 'rotateCertificates: true'
+  when: kubelet_config.stat.exists
+
+
+- name: Create .kube directory for ansible user
+  ansible.builtin.file:
+    path: /home/svc-ansible/.kube
+    state: directory
+    owner: svc-ansible
+    group: svc-ansible
+    mode: '0700'
+
+
+- name: Check if kubeconfig already exists for ansible user
+  ansible.builtin.stat:
+    path: /home/svc-ansible/.kube/config
+  register: kubeconfig_stat
